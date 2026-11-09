@@ -273,5 +273,33 @@ class WebappLaunchTests(FakeDispatchTestCase):
         self.assertEqual(r.unclaimed("chrome-web.whatsapp.com__-Default"), [])
 
 
+class NtpStandinTests(FakeDispatchTestCase):
+    def group(self, first_at, last_at):
+        now = time.time()
+        return {"class": "chromium", "kind": "browser", "profile": "Default",
+                "windows": [saved(6, (0, 0), "AliExpress", "AliExpress")],
+                "remaining": [saved(6, (0, 0), "AliExpress", "AliExpress")],
+                "deadline": now + 120, "first_window_at": first_at,
+                "last_group_change": last_at, "min_reopen_gap": 12, "reopen_after": now + 60}
+
+    def test_new_tab_is_not_claimed_while_windows_may_still_arrive(self):
+        desk = FakeDesk([client("0xntp", "chromium", 2, (0, 0), "New Tab - Chromium")])
+        self.use(desk)
+        r = make_restorer(desk, {"items": []})
+        g = self.group(time.time() - 1, time.time() - 1)
+        cands = [{"address": "0xntp", "title": "New Tab - Chromium", "raw": desk.clients[0]}]
+        self.assertFalse(r._claim_ntp_standin(g, cands))
+        self.assertIsNone(g.get("reopen_standin"))
+
+    def test_new_tab_is_claimed_after_the_profile_settles(self):
+        desk = FakeDesk([client("0xntp", "chromium", 2, (0, 0), "New Tab - Chromium")])
+        self.use(desk)
+        r = make_restorer(desk, {"items": []})
+        g = self.group(time.time() - 60, time.time() - 30)
+        cands = [{"address": "0xntp", "title": "New Tab - Chromium", "raw": desk.clients[0]}]
+        self.assertTrue(r._claim_ntp_standin(g, cands))
+        self.assertEqual(g["reopen_standin"], "0xntp")
+
+
 if __name__ == "__main__":
     unittest.main()

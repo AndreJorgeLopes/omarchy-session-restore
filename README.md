@@ -218,7 +218,9 @@ Windows are matched to workspaces by title. Unread counts and a shortened
 tab title (`JLCPCB`, `Gmail`) still match, and each profile only takes its
 own windows. If something is still missing after new windows stop appearing,
 the plugin sends Chrome's reopen-closed-window shortcut (the same action as
-History → recently closed), once per missing window.
+History → recently closed), once per profile. A New Tab placeholder is only
+taken as a stand-in for a missing window after that profile's windows have
+stopped appearing, so a window Chrome is still restoring is not written off.
 
 Each window is placed by its name: the XDG tag when the app sets one,
 otherwise the title Hyprland saw when the window was created (`initialTitle`),

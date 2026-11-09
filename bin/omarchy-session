@@ -3887,7 +3887,10 @@ class Restorer:
         Chromium sometimes opens a first-run placeholder instead of restoring
         the saved session for a secondary profile. Place that window on the
         first missing saved window's workspace and use it as the Ctrl+Shift+T
-        target so Recently Closed can bring the real windows back.
+        target so Recently Closed can bring the real windows back. The claim
+        waits until the profile's windows have settled, so a New Tab that
+        Chrome is about to fill, or a real window still on its way, is not
+        mistaken for a failed restore.
         """
         if g.get("reopen_standin") or not g.get("remaining"):
             return False
@@ -3902,6 +3905,18 @@ class Restorer:
             if is_ntp_like_title(title) or is_ntp_like_title(initial):
                 ntps.append(c)
         if not ntps:
+            return False
+        # Chrome opens a New Tab first and fills it, or opens the real windows,
+        # a few seconds later. Wait until this profile's windows stop
+        # appearing before deciding the placeholder is all that will come.
+        now = time.time()
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+        first = g.get("first_window_at") or g.setdefault("ntp_seen_at", now)
+        last = max(g.get("last_group_change") or 0, first)
+        near_deadline = now + 15 >= g.get("deadline", 0)
+        if not near_deadline and (
+                now - first < max(8, int(g.get("min_reopen_gap", settle)))
+                or now - last < settle):
             return False
         others = [
             p for p in self.pending
@@ -4546,7 +4561,9 @@ class Restorer:
                         "windows": list(wins), "remaining": list(wins), "snapshot": snapshot,
                         "deadline": now + wait, "deadline_cap": now + wait + wait // 2,
                         "reopen_after": reopen_after, "reopen_attempts": 0,
-                        "reopen_budget": len(wins), "reopen_stop": False,
+                        # One reopen-closed-window per profile: each extra
+                        # Ctrl+Shift+T risks duplicating a window Chrome restored.
+                        "reopen_budget": 1, "reopen_stop": False,
                         "min_reopen_gap": max(8, settle),
                         "first_window_at": None, "last_group_change": None,
                         "seen_addrs": [], "reopen_standin": None,
