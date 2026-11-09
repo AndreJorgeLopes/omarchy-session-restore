@@ -386,6 +386,11 @@ the same workspace.
 kimi, and many others (binary, mise/npm shim, or `node …/cli.js`). Session id
 from live state, original argv, or newest transcript — otherwise the agent’s
 own “continue latest” (`claude --continue`, `codex resume --last`, …).
+OpenCode keeps its open session out of the command line, so its id comes from
+the terminal title (`OC | <session title>`) looked up read-only in
+`opencode.db`. Only a title that names exactly one session of that folder is
+used; otherwise the terminal comes back as a plain shell in that folder,
+never `--continue` (several terminals would all attach to one session).
 Permission-skipping flags are never added; one-shot runs (`claude -p`, …) are
 not restarted; no prompt is ever sent. Agents inside herdr are left to herdr.
 

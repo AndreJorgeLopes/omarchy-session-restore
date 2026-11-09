@@ -301,5 +301,62 @@ class NtpStandinTests(FakeDispatchTestCase):
         self.assertEqual(g["reopen_standin"], "0xntp")
 
 
+class OpencodeSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.db = os.path.join(self.tmp, "opencode.db")
+        con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, directory TEXT)")
+        con.executemany("INSERT INTO session_v2 VALUES (?, ?, ?)", [
+            ("ses_one", "Omarchi workspace and hibernation issues", "/home/u"),
+            ("ses_long", "Omarchy upgrade and configuration recovery", "/home/u"),
+            ("ses_g1", "Greeting", "/home/u"),
+            ("ses_g2", "Greeting", "/home/u"),
+            ("ses_work", "Only in Work", "/home/u/Work"),
+        ])
+        con.commit()
+        con.close()
+
+    def lookup(self, title, directory="/home/u"):
+        return m.opencode_session_by_title(title, directory, db=self.db)
+
+    def test_exact_title(self):
+        self.assertEqual(self.lookup("OC | Omarchi workspace and hibernation issues"), "ses_one")
+
+    def test_title_cut_by_the_tui(self):
+        self.assertEqual(self.lookup("OC | Omarchy upgrade and configuration rec\u2026"), "ses_long")
+
+    def test_repeated_title_is_not_guessed(self):
+        self.assertIsNone(self.lookup("OC | Greeting"))
+
+    def test_session_of_another_folder_is_not_used(self):
+        self.assertIsNone(self.lookup("OC | Only in Work"))
+        self.assertEqual(self.lookup("OC | Only in Work", "/home/u/Work"), "ses_work")
+
+    def test_untitled_and_foreign_titles(self):
+        self.assertIsNone(self.lookup("OpenCode"))
+        self.assertIsNone(self.lookup("cigano@host:~"))
+        self.assertIsNone(m.opencode_session_by_title("OC | x", "/home/u",
+                                                      db=os.path.join(self.tmp, "missing.db")))
+
+    def test_resume_uses_the_title_and_falls_back_to_a_plain_shell(self):
+        spec = m.AGENTS["opencode"]
+        patches = {
+            "children": lambda pid: [100] if pid == 1 else [],
+            "match_agent": lambda pid: ("opencode", spec, ["--continue"], "opencode") if pid == 100 else None,
+            "cwd_of": lambda pid: "/home/u",
+            "opencode_db_path": lambda: self.db,
+        }
+        for name, fn in patches.items():
+            self.addCleanup(setattr, m, name, getattr(m, name))
+            setattr(m, name, fn)
+        got = m.agent_resume(1, "OC | Omarchi workspace and hibernation issues")
+        self.assertEqual(got["resume"], ["opencode", "--session", "ses_one"])
+        # No id: never `--continue` (it attaches every terminal to one session).
+        self.assertIsNone(m.agent_resume(1, "OC | Greeting"))
+        self.assertIsNone(m.agent_resume(1, "OpenCode"))
+
+
 if __name__ == "__main__":
     unittest.main()

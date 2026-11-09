@@ -38,10 +38,12 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 VERSION = "1.3.6"
 FORMAT = 1
@@ -1152,8 +1154,13 @@ AGENTS = {
                    ids=["--resume", "-r"], resume=["--resume", "{id}"], cont=["--resume", "latest"],
                    carry=["--model", "-m", "--approval-mode"], carry_bare=["--yolo", "-y", "--sandbox", "-s"],
                    skip=["-p", "--prompt"]),
-    "opencode": dict(bins=["opencode"], pkg=["opencode-ai", "/installs/opencode/"],
-                     ids=["--session", "-s"], resume=["--session", "{id}"], cont=["--continue"],
+    # OpenCode never puts the open session on its command line and keeps it in
+    # a shared server, so the id comes from the window title (see
+    # opencode_session_by_title). `--continue` is not used: several terminals
+    # in one folder would all attach to the same latest session. No id means a
+    # plain shell (shell=True), not a fresh agent that looks like the old one.
+    "opencode": dict(bins=["opencode"], pkg=["opencode-ai", "/installs/opencode/", "@opencode/cli"],
+                     ids=["--session", "-s"], resume=["--session", "{id}"], cont=None, shell=True,
                      carry=["--model", "-m", "--agent"], skip=["run", "serve", "auth", "mcp"]),
     "kilo": dict(bins=["kilo", "kilocode"], pkg=["@kilocode/cli"],
                  ids=["--session", "-s"], resume=["--session", "{id}"], cont=["--continue"],
@@ -1274,11 +1281,75 @@ def fd_match(pid, rx):
 
 NO_CONVERSATION = "no conversation yet"
 
+# The OpenCode TUI titles its terminal "OC | <session title>", cut to 37
+# characters plus "…" when the title is longer than 40.
+_OPENCODE_TITLE_RE = re.compile(r"^OC \| (.+)$")
+_OPENCODE_TITLE_MAX = 40
 
-def agent_session_id(name, spec, pid, args, cwd):
+
+def opencode_db_path():
+    return os.path.join(XDG_DATA, "opencode", "opencode.db")
+
+
+def opencode_sessions(directory, db=None):
+    """(id, title) of OpenCode sessions started in `directory`, read-only."""
+    path = db or opencode_db_path()
+    if not directory or not os.path.exists(path):
+        return []
+    uri = "file:" + urllib.parse.quote(path) + "?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+    except sqlite3.Error:
+        return []
+    try:
+        # session_v2 is OpenCode 2's table; `session` is the 1.x one.
+        for table in ("session_v2", "session"):
+            try:
+                return [(str(i), t or "") for i, t in con.execute(
+                    f"SELECT id, title FROM {table} WHERE directory = ?", (directory,))]
+            except sqlite3.Error:
+                continue
+        return []
+    finally:
+        con.close()
+
+
+def opencode_session_by_title(window_title, directory, db=None):
+    """Session id for the OpenCode TUI showing `window_title`, or None.
+
+    Only a title that names exactly one session started in `directory` is
+    trusted. Untitled sessions ("OpenCode"), repeated titles and sessions of
+    another folder give None, so restore never attaches the wrong session.
+    """
+    m = _OPENCODE_TITLE_RE.match(window_title or "")
+    if not m:
+        return None
+    shown = m.group(1)
+    cut = shown.endswith("\u2026")
+    stem = shown[:-1] if cut else shown
+    hits = []
+    for sid, title in opencode_sessions(directory, db):
+        if not title:
+            continue
+        if title == shown or (cut and len(title) > _OPENCODE_TITLE_MAX and title.startswith(stem)):
+            hits.append(sid)
+    if len(hits) == 1 and ID_RE.fullmatch(hits[0]):
+        return hits[0]
+    return None
+
+
+def agent_session_id(name, spec, pid, args, cwd, title=""):
     """(id, where it came from) or (None, ''). Live state (session registries,
-    open transcript files) wins over the command line, because the user may
-    have switched conversations (/new, /resume) since the agent started."""
+    open transcript files, the window title) wins over the command line,
+    because the user may have switched conversations (/new, /resume) since
+    the agent started."""
+    if name == "opencode" and title:
+        try:
+            sid = opencode_session_by_title(title, cwd)
+        except (OSError, sqlite3.Error):
+            sid = None
+        if sid:
+            return sid, "window title + opencode.db"
     try:
         if name == "grok":
             with open(os.path.join(HOME, ".grok", "active_sessions.json")) as f:
@@ -1323,8 +1394,12 @@ def agent_session_id(name, spec, pid, args, cwd):
     return None, ""
 
 
-def agent_resume(shell_pid):
-    """How to restart the coding agent running in this shell, or None."""
+def agent_resume(shell_pid, title=""):
+    """How to restart the coding agent running in this shell, or None.
+
+    `title` is the terminal window's title; some agents (OpenCode) only show
+    their session there.
+    """
     kids = children(shell_pid)
     if not kids:
         return None
@@ -1338,7 +1413,11 @@ def agent_resume(shell_pid):
                any(a in spec.get("skip", []) for a in args if a.startswith("-")):
                 return None
             cwd = cwd_of(pid)
-            sid, src = agent_session_id(name, spec, pid, args, cwd)
+            sid, src = agent_session_id(name, spec, pid, args, cwd, title)
+            if not sid and spec.get("shell") and src != NO_CONVERSATION:
+                # Restarting it would open a different session in the old
+                # session's place. A plain shell in the same folder is safer.
+                return None
             if sid and spec.get("resume"):
                 tail = [x.replace("{id}", sid) for x in spec["resume"]]
                 label = f"{name} — resume session {sid} (id from {src})"
@@ -1407,7 +1486,7 @@ def cleanup_shell_files():
                 pass
 
 
-def shell_info(cfg, k):
+def shell_info(cfg, k, title=""):
     """State of one interactive shell. The directory is the shell's own cwd.
 
     A foreground program (vim, ssh, a coding agent) keeps its own cwd and
@@ -1437,7 +1516,7 @@ def shell_info(cfg, k):
         label = base(resume[0])
     elif cfg.get("resume_agents", True):
         try:
-            ag = agent_resume(k)
+            ag = agent_resume(k, title)
         except OSError:
             ag = None
         if ag:
@@ -2838,7 +2917,7 @@ def snapshot(cfg):
                         continue
                     if plan.get("shell_pid"):
                         try:
-                            sh = shell_info(cfg, plan["shell_pid"])
+                            sh = shell_info(cfg, plan["shell_pid"], c.get("title") or "")
                         except OSError:
                             sh = {"cwd": HOME, "resume": None, "label": "", "atuin": "",
                                   "hooked": False, "start": 0}
