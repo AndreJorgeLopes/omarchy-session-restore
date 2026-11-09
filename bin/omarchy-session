@@ -81,6 +81,7 @@ DEFAULTS = {
     "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
     "terminal_wait_seconds": 10,
     "app_wait_seconds": 20,
+    "late_window_seconds": 30,     # extra wait for an app window that missed app_wait_seconds
     "skip_classes": [],            # window classes never saved (regexes, full match)
     "resume_commands": ["herdr", "tmux", "zellij", "screen", "nvim", "vim", "vi",
                         "hx", "helix", "btop", "htop", "top", "lazygit",
@@ -1907,6 +1908,31 @@ def column_groups(ids_and_x, slack=_COLUMN_X_SLACK):
     return groups
 
 
+def reading_order(pos, slack=_COLUMN_X_SLACK):
+    """Ids left to right by column, then top to bottom inside a column.
+
+    `pos` maps id → (x, y). Dwindle stacks windows in one column, so x alone
+    cannot order them (WhatsApp above Discord share the same x).
+    """
+    order = []
+    for group in column_groups([(a, p[0]) for a, p in pos.items()], slack):
+        order += [a for a, _x in sorted(group, key=lambda t: (pos[t[0]][1], t[0]))]
+    return order
+
+
+def next_slot_swap(desired, live_pos, slack=_COLUMN_X_SLACK):
+    """(window, occupant) to swap so `desired` fills the live slots in reading order.
+
+    None when every window already sits in its slot. Each swap puts one more
+    window into its final slot, so at most len(desired) - 1 swaps are needed.
+    """
+    actual = reading_order({a: live_pos.get(a, (0, 0)) for a in desired}, slack)
+    for want, here in zip(desired, actual):
+        if want != here:
+            return want, here
+    return None
+
+
 def inversion_index(actual_ids, desired_ids):
     """First adjacent pair that is out of desired order, or None."""
     rank = {a: i for i, a in enumerate(desired_ids)}
@@ -2266,8 +2292,39 @@ def window_name_score(saved, live):
     return max(scores) if scores else 0.0
 
 
+def _shared_initial_names(saved, clients):
+    """(class, name) pairs whose creation name several windows of that class carry.
+
+    Zen opens every window as "Zen Browser" and foot as "foot". Such a name
+    scores 1.0 against every other window of the class, so it cannot tell
+    them apart and must not be used to pair them.
+    """
+    counts = {}
+    for rows, field in ((saved, "initial_title"), (clients, "initialTitle")):
+        seen = {}
+        for r in rows:
+            key = browser_title_key(r.get(field) or r.get("initial_title") or "")
+            if key:
+                k = ((r.get("class") or "").lower(), key)
+                seen[k] = seen.get(k, 0) + 1
+        for k, n in seen.items():
+            counts[k] = max(counts.get(k, 0), n)
+    return {k for k, n in counts.items() if n > 1}
+
+
 def match_windows_by_name(saved, clients, threshold=_TITLE_ACCEPT):
     """Pair saved windows to live ones by name. Returns (saved_i, client_i, score)."""
+    shared = _shared_initial_names(saved, clients)
+    if shared:
+        def _strip(r, fields):
+            cls = (r.get("class") or "").lower()
+            out = dict(r)
+            for f in fields:
+                if (cls, browser_title_key(r.get(f) or "")) in shared:
+                    out[f] = ""
+            return out
+        saved = [_strip(w, ("initial_title",)) for w in saved]
+        clients = [_strip(c, ("initialTitle", "initial_title")) for c in clients]
     scored = []
     for si, w in enumerate(saved):
         for ci, c in enumerate(clients):
@@ -3386,7 +3443,9 @@ def ordered_items(sess):
     br = [i for i in items if i["kind"] == "browser"]
     mid = sorted([i for i in items if i["kind"] in ("terminal", "app")], key=pos)
     web = sorted([i for i in items if i["kind"] == "webapp"], key=pos)
-    return br + mid + web
+    # Web apps open in about a second. Queued last, they waited behind every
+    # app's launch wait (a 20 s Steam timeout) and showed up a minute late.
+    return br + web + mid
 
 
 def primary_ws(it):
@@ -3501,6 +3560,8 @@ class Restorer:
         self.placed = 0
         self.failed = []
         self.placed_at = {}    # address → saved window, for layout rebuild
+        self.placed_src = {}   # address → (id of the saved window, live class) it was placed for
+        self._late = []        # classes whose window missed its launch wait
         self._prof_cache = {}
         self.hooked = hook_installed()
         self.refocus = None
@@ -3518,13 +3579,26 @@ class Restorer:
     def unclaimed(self, cls, include_known=False):
         out = []
         for c in self.clients():
-            if c["address"] in self.claimed:
+            if c["address"] in self.claimed and not self._reused_address(c):
                 continue
             if c["address"] in self.known and not include_known:
                 continue
             if (c.get("class") or c.get("initialClass") or "").lower() == cls.lower():
                 out.append(c)
         return out
+
+    def _reused_address(self, c):
+        """True when a claimed address now belongs to a window of another class.
+
+        Hyprland reuses the address of a closed window. A Steam splash was
+        claimed, closed, and the WhatsApp window that took its address stayed
+        invisible to the launch wait until it timed out.
+        """
+        src = self.placed_src.get(c.get("address"))
+        if not src:
+            return False
+        live = (c.get("class") or c.get("initialClass") or "").lower()
+        return bool(src[1]) and live != src[1].lower()
 
     def launch(self, argv, ws):
         a = list(argv)
@@ -3537,6 +3611,7 @@ class Restorer:
         addr = "address:" + c["address"]
         L = lua_long
         self.claimed.add(c["address"])
+        self.placed_src[c["address"]] = (id(w), c.get("class") or c.get("initialClass") or "")
         monitors_now = getattr(self, "monitors_now", None) or hypr_json("monitors")
         w = clamp_floating(w, monitors_now, (getattr(self, "sess", {}) or {}).get("monitors") or [])
         self.placed_at[c["address"]] = w
@@ -4095,13 +4170,19 @@ class Restorer:
         layout Hyprland answers "No window to swap with in that direction" and
         a bubble-sort retries that same swap until it gives up, leaving the
         windows stacked in one column. Scrolling windows are split into their
-        own columns and ordered with ``swapcol``. Other layouts swap the two
-        specific windows that are out of order.
+        own columns and ordered with ``swapcol``. Other layouts swap windows
+        into the live slots in reading order (column, then top to bottom).
+
+        Every workspace with two or more tiled windows that can be tied to the
+        save is ordered: windows the restorer moved, windows it found already
+        in place, and windows that arrived late. A window placed early can be
+        gone by now (a Discord or Steam splash), so the pairing is rebuilt
+        from the live windows here instead of trusting ``placed_at`` alone.
         """
-        del sess  # order comes from windows place() actually moved
+        pairs = self._final_pairs(sess)
         live = {c["address"]: c for c in self.clients()}
         by_ws = {}
-        for addr, saved in self.placed_at.items():
+        for addr, saved in pairs.items():
             if not isinstance(saved, dict) or saved.get("floating") or not saved.get("at"):
                 continue
             c = live.get(addr)
@@ -4110,12 +4191,61 @@ class Restorer:
             ws = (c.get("workspace") or {}).get("id")
             if not isinstance(ws, int):
                 continue
-            by_ws.setdefault(ws, {})[addr] = saved["at"][0]
-        for ws, xpos in by_ws.items():
-            if len(xpos) < 2:
+            at = saved["at"]
+            by_ws.setdefault(ws, {})[addr] = (at[0], at[1] if len(at) > 1 else 0)
+        for ws, pos in sorted(by_ws.items()):
+            if len(pos) < 2:
                 continue
-            desired = [a for a, _x in sorted(xpos.items(), key=lambda t: (t[1], t[0]))]
-            self._order_workspace(ws, desired)
+            self._order_workspace(ws, reading_order(pos))
+
+    def _final_pairs(self, sess):
+        """address → saved window for live windows on their saved workspace."""
+        clients = self.clients()
+        held = self._held_in_place(clients)
+        pairs = {addr: self.placed_at[addr] for addr in held}
+        taken = set(held.values())
+        saved = [s for s in self._saved_rows(sess or {}) if id(s["window"]) not in taken]
+        rest = [c for c in clients if c.get("address") not in held and not c.get("floating")]
+        live = self._live_rows(rest)
+        for si, ci, _score in match_windows_by_name(saved, live):
+            w = saved[si]["window"]
+            c = live[ci]["raw"]
+            if self._client_ws(c) == ws_selector(w):
+                pairs[c["address"]] = w
+        return pairs
+
+    def _missing_late(self, sess):
+        """Late classes that still have fewer live windows than were saved."""
+        want, have = {}, {}
+        for it in (sess or {}).get("items") or []:
+            k = (it.get("class") or "").lower()
+            want[k] = want.get(k, 0) + len(it.get("windows") or [])
+        for c in self.clients():
+            k = (c.get("class") or c.get("initialClass") or "").lower()
+            have[k] = have.get(k, 0) + 1
+        return sorted({cls for cls in self._late if have.get(cls.lower(), 0) < want.get(cls.lower(), 0)})
+
+    def wait_late_windows(self, sess):
+        """Give windows that missed their launch wait a last chance.
+
+        A web app can take most of a minute to open after login. It is placed
+        by name when it arrives, before the final ordering pass.
+        """
+        cap = max(0, int(self.cfg.get("late_window_seconds", 30)))
+        end = time.time() + cap
+        sig = None
+        missing = self._missing_late(sess)
+        if missing and cap:
+            log(f"restore: waiting up to {cap}s for late windows: {missing}")
+        while missing and time.time() < end:
+            names = tuple(sorted(
+                (c.get("address"), c.get("title") or "", (c.get("workspace") or {}).get("id"))
+                for c in self.clients()))
+            if names != sig:
+                sig = names
+                self.place_named_windows()
+            time.sleep(0.5)
+            missing = self._missing_late(sess)
 
     def _order_workspace(self, ws, desired):
         layout = self._layout(ws)
@@ -4125,30 +4255,37 @@ class Restorer:
         else:
             self._order_by_target_swap(ws, desired, layout)
 
+    def _live_pos(self, addrs):
+        out = {}
+        live = {c["address"]: c for c in self.clients()}
+        for a in addrs:
+            at = (live.get(a) or {}).get("at") or [0, 0]
+            out[a] = (at[0] if at else 0, at[1] if len(at) > 1 else 0)
+        return out
+
     def _order_by_target_swap(self, ws, desired, layout):
-        for _ in range(max(1, len(desired) * len(desired))):
-            if self._order_is_spread(desired):
+        """Swap windows into the live slots, read column by column, top to bottom."""
+        for _ in range(max(1, len(desired))):
+            before = self._live_pos(desired)
+            step = next_slot_swap(desired, before)
+            if step is None:
                 log(f"restore: order workspace {ws} layout={layout or '?'} ok")
                 return
-            xs = self._live_xs(desired)
-            actual = sorted(desired, key=lambda a: (xs.get(a, 0), a))
-            i = inversion_index(actual, desired)
-            if i is None:
-                log(f"restore: order workspace {ws} layout={layout or '?'} "
-                    "windows still share a column; target swap has no inversion to fix")
-                return
-            left, right = actual[i], actual[i + 1]
-            before = dict(xs)
+            want, here = step
+            log(f"restore: order workspace {ws} swap {want} into the slot of {here}")
             dispatch(
-                f"hl.dsp.window.swap({{ target = {lua_long('address:' + right)}, "
-                f"window = {lua_long('address:' + left)} }})"
+                f"hl.dsp.window.swap({{ target = {lua_long('address:' + here)}, "
+                f"window = {lua_long('address:' + want)} }})"
             )
             time.sleep(0.05)
-            if self._live_xs(desired) == before:
+            if self._live_pos(desired) == before:
                 log(f"restore: order workspace {ws} layout={layout or '?'} "
-                    f"target swap made no progress left={left} right={right}")
+                    f"target swap made no progress window={want} target={here}")
                 return
-        log(f"restore: order workspace {ws} layout={layout or '?'} stopped after max swaps")
+        if next_slot_swap(desired, self._live_pos(desired)) is None:
+            log(f"restore: order workspace {ws} layout={layout or '?'} ok")
+        else:
+            log(f"restore: order workspace {ws} layout={layout or '?'} stopped after max swaps")
 
     def _order_scrolling(self, ws, desired):
         rank = {a: i for i, a in enumerate(desired)}
@@ -4242,28 +4379,14 @@ class Restorer:
         sess = getattr(self, "sess", None)
         if not sess:
             return 0
-        saved = []
-        for it in sess.get("items") or []:
-            cls = it.get("class") or ""
-            prof = it.get("profile") or ""
-            for w in it.get("windows") or []:
-                saved.append({
-                    "class": cls, "profile": prof, "window": w,
-                    "title": w.get("title") or "",
-                    "initial_title": w.get("initial_title") or "",
-                    "xdg_tag": w.get("xdg_tag") or "",
-                })
-        live = []
-        for c in self.clients():
-            live.append({
-                "address": c.get("address"),
-                "title": c.get("title") or "",
-                "initialTitle": c.get("initialTitle") or "",
-                "xdgTag": c.get("xdgTag") or "",
-                "class": c.get("class") or c.get("initialClass") or "",
-                "profile": self._profile_of_client(c),
-                "raw": c,
-            })
+        clients = self.clients()
+        # A window an earlier pass placed, and that is still where it was put,
+        # keeps its place, and its saved window is taken. Re-pairing them by
+        # name only swaps look-alike windows (two Zen windows, two terminals).
+        held = self._held_in_place(clients)
+        taken = set(held.values())
+        saved = [s for s in self._saved_rows(sess) if id(s["window"]) not in taken]
+        live = self._live_rows([c for c in clients if c.get("address") not in held])
         moved = 0
         tried = getattr(self, "_name_tried", None)
         if tried is None:
@@ -4275,6 +4398,7 @@ class Restorer:
             target = ws_selector(w)
             cur = self._client_ws(raw)
             if cur == target:
+                self._remember(addr, raw, w)
                 continue
             # One attempt per live title. A loading name ("Gmail") and the
             # later mailbox name each get a move; a 150s wait does not repeat.
@@ -4288,11 +4412,73 @@ class Restorer:
                 f"name={clip_title(shown)!r}")
             if self._move_to_workspace(raw, w, cls):
                 moved += 1
-                self.placed_at[addr] = w
-                self.claimed.add(addr)
+                self._remember(addr, raw, w)
             else:
                 self.failed.append(cls)
         return moved
+
+    def _remember(self, addr, c, w):
+        """Record a live window as the one restored for saved window `w`."""
+        self.placed_at[addr] = w
+        self.placed_src[addr] = (id(w), c.get("class") or c.get("initialClass") or "")
+        self.claimed.add(addr)
+        cls = c.get("class") or c.get("initialClass") or ""
+        # It missed its launch wait but did arrive: not a restore problem.
+        if cls in self._late:
+            self._late.remove(cls)
+            if cls in self.failed:
+                self.failed.remove(cls)
+
+    def _held_in_place(self, clients):
+        """address → id of saved window, for placed windows still where they were put.
+
+        The class must still match: Hyprland reuses a closed window's address
+        (a Steam or Discord splash), and the new window is not the placed one.
+        """
+        live = {c.get("address"): c for c in clients}
+        held = {}
+        for addr, (wid, cls) in self.placed_src.items():
+            c = live.get(addr)
+            w = self.placed_at.get(addr)
+            if not c or not isinstance(w, dict):
+                continue
+            if (c.get("class") or c.get("initialClass") or "").lower() != (cls or "").lower():
+                continue
+            if self._client_ws(c) != ws_selector(w):
+                continue
+            if wid in held.values():
+                continue
+            held[addr] = wid
+        return held
+
+    @staticmethod
+    def _saved_rows(sess):
+        saved = []
+        for it in sess.get("items") or []:
+            cls = it.get("class") or ""
+            prof = it.get("profile") or ""
+            for w in it.get("windows") or []:
+                saved.append({
+                    "class": cls, "profile": prof, "window": w,
+                    "title": w.get("title") or "",
+                    "initial_title": w.get("initial_title") or "",
+                    "xdg_tag": w.get("xdg_tag") or "",
+                })
+        return saved
+
+    def _live_rows(self, clients):
+        live = []
+        for c in clients:
+            live.append({
+                "address": c.get("address"),
+                "title": c.get("title") or "",
+                "initialTitle": c.get("initialTitle") or "",
+                "xdgTag": c.get("xdgTag") or "",
+                "class": c.get("class") or c.get("initialClass") or "",
+                "profile": self._profile_of_client(c),
+                "raw": c,
+            })
+        return live
 
     def run(self, sess):
         self.sess = sess
@@ -4387,6 +4573,7 @@ class Restorer:
                 if not c:
                     log(f"restore: no window appeared for {cls} within {timeout}s")
                     self.failed.append(cls)
+                    self._late.append(cls)
                     continue
                 self.place(c, wins[0])
                 if len(wins) > 1:
@@ -4396,7 +4583,10 @@ class Restorer:
                 log(f"restore: {cls}: {e!r}")
                 self.failed.append(cls)
         self.wait_pending()
+        self.wait_late_windows(sess)
         self.place_named_windows()
+        # Last step, once, on the final state: every window is placed, late
+        # windows have arrived and reopen-closed-window has run.
         self.reorder_tiled(sess)
         if self.refocus and self.prev_focus:
             dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + self.prev_focus)} }})")
@@ -4439,6 +4629,7 @@ class Restorer:
                 if not c:
                     log(f"restore: no window appeared for {cls} within {self.cfg['terminal_wait_seconds']}s")
                     self.failed.append(cls)
+                    self._late.append(cls)
                     continue
                 self.place(c, w0 if gi == 0 else dict(w0, fullscreen=0))
                 if q:

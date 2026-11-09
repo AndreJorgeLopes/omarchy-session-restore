@@ -226,12 +226,21 @@ otherwise the current title. Before launch, a temporary Hyprland rule opens
 that named window on its saved workspace, so a late Chrome window does not
 sit on workspace 1 until something moves it. The rule is removed when restore
 finishes. A later pass moves any window whose name is recognizable but which
-is still on the wrong workspace. The move is checked, and if the numeric
-workspace id does not stick, it is retried with the workspace's name.
+is still on the wrong workspace. It leaves alone a window an earlier step
+already placed and that is still there, and it ignores a creation name that
+several windows share ("Zen Browser", "foot"), so look-alike windows are not
+swapped. The move is checked, and if the numeric workspace id does not stick,
+it is retried with the workspace's name.
 
-Tiled windows are then ordered left to right. On the scrolling layout each
-window is given its own column; a directional "swap right" is not used,
-because that dispatcher has no neighbor there and leaves the windows stacked.
+Web apps are launched right after browsers, before other apps, so a slow app
+launch does not hold them back.
+
+Tiled windows are ordered last, once, after late windows and the Chrome
+reopen step: by column, then top to bottom inside a column, on every
+workspace with two or more windows that match the save (moved by restore or
+already in place). On the scrolling layout each window is given its own
+column; a directional "swap right" is not used, because that dispatcher has
+no neighbor there and leaves the windows stacked.
 
 ---
 
@@ -464,6 +473,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 | `save_interval_seconds` | `60` | Periodic autosave interval |
 | `browser_wait_seconds` | `150` | Cap on how long to wait for browser windows. Restore returns as soon as every saved window has matched. While new windows are still appearing the cap can stretch by half again |
 | `browser_settle_seconds` | `12` | Quiet period with no new windows before reopening a missing Chrome window |
+| `late_window_seconds` | `30` | Extra wait, before the final layout pass, for an app or web-app window that did not appear within its launch wait |
 | `restore_chromium_session` | `true` | After a clean Chrome exit, restore the pre-logout session snapshot so every window comes back |
 | `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
 | `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
@@ -479,8 +489,9 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 
 * **Dwindle split tree** — Hyprland does not expose the exact split tree over
   IPC. Workspace *mode* (dwindle / scrolling / floating) is restored; exact
-  split ratios are not. Tiled windows are ordered left to right (on the
-  scrolling layout, each in its own column). If the layout still disagrees,
+  split ratios are not. Tiled windows are put back in their saved order,
+  column by column and top to bottom (on the scrolling layout, each in its
+  own column). If the layout still disagrees,
   drag one past the other once.
 * **Scrolling column widths** — hyprscrolling column widths are not in IPC.
 * **First time on a new dock / display** — no saved layout yet; arrange once,
